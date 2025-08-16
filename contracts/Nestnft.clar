@@ -19,10 +19,21 @@
 (define-constant err-payment-failed (err u114))
 (define-constant err-not-bidder (err u115))
 (define-constant err-cannot-bid-own-nft (err u116))
+(define-constant err-beneficiary-not-found (err u117))
+(define-constant err-beneficiary-already-exists (err u118))
+(define-constant err-not-beneficiary (err u119))
+(define-constant err-inheritance-not-claimable (err u120))
+(define-constant err-beneficiary-limit-reached (err u121))
+(define-constant err-cannot-designate-self (err u122))
+(define-constant err-inheritance-period-not-met (err u123))
+(define-constant err-death-certificate-required (err u124))
+(define-constant err-beneficiary-verification-failed (err u125))
 
 (define-data-var last-token-id uint u0)
 (define-data-var total-pension-value uint u0)
 (define-data-var marketplace-fee-percentage uint u250)
+(define-data-var inheritance-waiting-period uint u4320)
+(define-data-var max-beneficiaries-per-token uint u5)
 
 (define-map token-count principal uint)
 
@@ -72,6 +83,39 @@
 
 (define-map bidder-deposits principal uint)
 
+(define-map pension-beneficiaries uint {
+    primary-beneficiary: (optional principal),
+    secondary-beneficiaries: (list 4 principal),
+    inheritance-percentage: (list 5 uint),
+    beneficiary-count: uint,
+    designation-date: uint,
+    last-updated: uint
+})
+
+(define-map beneficiary-verification {token-id: uint, beneficiary: principal} {
+    verification-status: (string-ascii 20),
+    verification-date: uint,
+    death-certificate-submitted: bool,
+    approved-by: (optional principal),
+    inheritance-claim-date: (optional uint)
+})
+
+(define-map inheritance-claims uint {
+    claimant: principal,
+    claim-date: uint,
+    waiting-period-end: uint,
+    claim-status: (string-ascii 20),
+    verification-required: bool,
+    contested: bool
+})
+
+(define-map beneficiary-rights {token-id: uint, beneficiary: principal} {
+    inheritance-percentage: uint,
+    designation-date: uint,
+    is-active: bool,
+    priority-level: uint
+})
+
 (define-public (mint-pension-nft 
     (recipient principal)
     (employer (string-ascii 50))
@@ -102,6 +146,15 @@
             is-vested: (>= stacks-block-height vesting-date),
             is-claimed: false,
             created-at: stacks-block-height
+        })
+        
+        (map-set pension-beneficiaries token-id {
+            primary-beneficiary: none,
+            secondary-beneficiaries: (list),
+            inheritance-percentage: (list u100),
+            beneficiary-count: u0,
+            designation-date: stacks-block-height,
+            last-updated: stacks-block-height
         })
         
         (map-set pension-valuations token-id {
@@ -478,3 +531,346 @@
         (err err-listing-not-found)
     )
 )
+
+(define-public (designate-primary-beneficiary (token-id uint) (beneficiary principal) (inheritance-percentage uint))
+    (let ((token-owner (unwrap! (nft-get-owner? pension-nft token-id) err-nft-not-found))
+          (current-beneficiaries (default-to {
+              primary-beneficiary: none,
+              secondary-beneficiaries: (list),
+              inheritance-percentage: (list),
+              beneficiary-count: u0,
+              designation-date: stacks-block-height,
+              last-updated: stacks-block-height
+          } (map-get? pension-beneficiaries token-id))))
+        
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (not (is-eq tx-sender beneficiary)) err-cannot-designate-self)
+        (asserts! (> inheritance-percentage u0) err-invalid-pension-data)
+        (asserts! (<= inheritance-percentage u100) err-invalid-pension-data)
+        
+        (map-set pension-beneficiaries token-id (merge current-beneficiaries {
+            primary-beneficiary: (some beneficiary),
+            inheritance-percentage: (list inheritance-percentage),
+            beneficiary-count: u1,
+            last-updated: stacks-block-height
+        }))
+        
+        (map-set beneficiary-rights {token-id: token-id, beneficiary: beneficiary} {
+            inheritance-percentage: inheritance-percentage,
+            designation-date: stacks-block-height,
+            is-active: true,
+            priority-level: u1
+        })
+        
+        (ok beneficiary)
+    )
+)
+
+(define-public (add-secondary-beneficiary (token-id uint) (beneficiary principal) (inheritance-percentage uint))
+    (let ((token-owner (unwrap! (nft-get-owner? pension-nft token-id) err-nft-not-found))
+          (current-beneficiaries (unwrap! (map-get? pension-beneficiaries token-id) err-beneficiary-not-found))
+          (secondary-list (get secondary-beneficiaries current-beneficiaries))
+          (percentage-list (get inheritance-percentage current-beneficiaries))
+          (current-count (get beneficiary-count current-beneficiaries)))
+        
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (not (is-eq tx-sender beneficiary)) err-cannot-designate-self)
+        (asserts! (< current-count (var-get max-beneficiaries-per-token)) err-beneficiary-limit-reached)
+        (asserts! (> inheritance-percentage u0) err-invalid-pension-data)
+        (asserts! (<= inheritance-percentage u100) err-invalid-pension-data)
+        
+        (let ((total-percentage (fold + percentage-list u0)))
+            (asserts! (<= (+ total-percentage inheritance-percentage) u100) err-invalid-pension-data)
+        )
+        
+        (map-set pension-beneficiaries token-id (merge current-beneficiaries {
+            secondary-beneficiaries: (unwrap! (as-max-len? (append secondary-list beneficiary) u4) err-beneficiary-limit-reached),
+            inheritance-percentage: (unwrap! (as-max-len? (append percentage-list inheritance-percentage) u5) err-invalid-pension-data),
+            beneficiary-count: (+ current-count u1),
+            last-updated: stacks-block-height
+        }))
+        
+        (map-set beneficiary-rights {token-id: token-id, beneficiary: beneficiary} {
+            inheritance-percentage: inheritance-percentage,
+            designation-date: stacks-block-height,
+            is-active: true,
+            priority-level: (+ current-count u1)
+        })
+        
+        (ok beneficiary)
+    )
+)
+
+(define-public (update-beneficiary-percentage (token-id uint) (beneficiary principal) (new-percentage uint))
+    (let ((token-owner (unwrap! (nft-get-owner? pension-nft token-id) err-nft-not-found))
+          (beneficiary-info (unwrap! (map-get? beneficiary-rights {token-id: token-id, beneficiary: beneficiary}) err-beneficiary-not-found))
+          (current-beneficiaries (unwrap! (map-get? pension-beneficiaries token-id) err-beneficiary-not-found)))
+        
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (get is-active beneficiary-info) err-beneficiary-not-found)
+        (asserts! (> new-percentage u0) err-invalid-pension-data)
+        (asserts! (<= new-percentage u100) err-invalid-pension-data)
+        
+        (map-set beneficiary-rights {token-id: token-id, beneficiary: beneficiary} (merge beneficiary-info {
+            inheritance-percentage: new-percentage
+        }))
+        
+        (map-set pension-beneficiaries token-id (merge current-beneficiaries {
+            last-updated: stacks-block-height
+        }))
+        
+        (ok new-percentage)
+    )
+)
+
+(define-public (remove-beneficiary (token-id uint) (beneficiary principal))
+    (let ((token-owner (unwrap! (nft-get-owner? pension-nft token-id) err-nft-not-found))
+          (beneficiary-info (unwrap! (map-get? beneficiary-rights {token-id: token-id, beneficiary: beneficiary}) err-beneficiary-not-found))
+          (current-beneficiaries (unwrap! (map-get? pension-beneficiaries token-id) err-beneficiary-not-found)))
+        
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (get is-active beneficiary-info) err-beneficiary-not-found)
+        
+        (map-set beneficiary-rights {token-id: token-id, beneficiary: beneficiary} (merge beneficiary-info {
+            is-active: false
+        }))
+        
+        (map-set pension-beneficiaries token-id (merge current-beneficiaries {
+            beneficiary-count: (- (get beneficiary-count current-beneficiaries) u1),
+            last-updated: stacks-block-height
+        }))
+        
+        (ok true)
+    )
+)
+
+(define-public (initiate-inheritance-claim (token-id uint))
+    (let ((beneficiary-info (unwrap! (map-get? beneficiary-rights {token-id: token-id, beneficiary: tx-sender}) err-not-beneficiary))
+          (current-owner (unwrap! (nft-get-owner? pension-nft token-id) err-nft-not-found))
+          (waiting-period-end (+ stacks-block-height (var-get inheritance-waiting-period))))
+        
+        (asserts! (get is-active beneficiary-info) err-not-beneficiary)
+        (asserts! (is-none (map-get? inheritance-claims token-id)) err-inheritance-not-claimable)
+        
+        (map-set inheritance-claims token-id {
+            claimant: tx-sender,
+            claim-date: stacks-block-height,
+            waiting-period-end: waiting-period-end,
+            claim-status: "pending",
+            verification-required: true,
+            contested: false
+        })
+        
+        (map-set beneficiary-verification {token-id: token-id, beneficiary: tx-sender} {
+            verification-status: "pending",
+            verification-date: stacks-block-height,
+            death-certificate-submitted: false,
+            approved-by: none,
+            inheritance-claim-date: (some stacks-block-height)
+        })
+        
+        (ok waiting-period-end)
+    )
+)
+
+(define-public (submit-death-certificate (token-id uint) (beneficiary principal))
+    (let ((verification-info (unwrap! (map-get? beneficiary-verification {token-id: token-id, beneficiary: beneficiary}) err-beneficiary-not-found))
+          (claim-info (unwrap! (map-get? inheritance-claims token-id) err-inheritance-not-claimable)))
+        
+        (asserts! (is-eq tx-sender beneficiary) err-not-beneficiary)
+        (asserts! (is-eq (get claimant claim-info) beneficiary) err-not-beneficiary)
+        
+        (map-set beneficiary-verification {token-id: token-id, beneficiary: beneficiary} (merge verification-info {
+            death-certificate-submitted: true,
+            verification-status: "cert-submitted"
+        }))
+        
+        (ok true)
+    )
+)
+
+(define-public (approve-inheritance-claim (token-id uint) (beneficiary principal))
+    (let ((verification-info (unwrap! (map-get? beneficiary-verification {token-id: token-id, beneficiary: beneficiary}) err-beneficiary-not-found))
+          (claim-info (unwrap! (map-get? inheritance-claims token-id) err-inheritance-not-claimable)))
+        
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (get death-certificate-submitted verification-info) err-death-certificate-required)
+        (asserts! (is-eq (get claimant claim-info) beneficiary) err-not-beneficiary)
+        
+        (map-set beneficiary-verification {token-id: token-id, beneficiary: beneficiary} (merge verification-info {
+            verification-status: "approved",
+            approved-by: (some tx-sender)
+        }))
+        
+        (map-set inheritance-claims token-id (merge claim-info {
+            claim-status: "approved",
+            verification-required: false
+        }))
+        
+        (ok true)
+    )
+)
+
+(define-public (finalize-inheritance-transfer (token-id uint))
+    (let ((claim-info (unwrap! (map-get? inheritance-claims token-id) err-inheritance-not-claimable))
+          (beneficiary (get claimant claim-info))
+          (current-owner (unwrap! (nft-get-owner? pension-nft token-id) err-nft-not-found))
+          (verification-info (unwrap! (map-get? beneficiary-verification {token-id: token-id, beneficiary: beneficiary}) err-beneficiary-verification-failed)))
+        
+        (asserts! (is-eq tx-sender beneficiary) err-not-beneficiary)
+        (asserts! (is-eq (get claim-status claim-info) "approved") err-inheritance-not-claimable)
+        (asserts! (>= stacks-block-height (get waiting-period-end claim-info)) err-inheritance-period-not-met)
+        (asserts! (not (get verification-required claim-info)) err-beneficiary-verification-failed)
+        (asserts! (is-eq (get verification-status verification-info) "approved") err-beneficiary-verification-failed)
+        
+        (try! (nft-transfer? pension-nft token-id current-owner beneficiary))
+        
+        (map-set pension-transfers token-id {
+            from: current-owner,
+            to: beneficiary,
+            transfer-date: stacks-block-height,
+            transfer-price: u0
+        })
+        
+        (let ((owner-pensions (default-to (list) (map-get? employee-pensions current-owner)))
+              (beneficiary-pensions (default-to (list) (map-get? employee-pensions beneficiary))))
+            (map-set employee-pensions current-owner (filter-pension-list owner-pensions token-id))
+            (map-set employee-pensions beneficiary (unwrap! (as-max-len? (append beneficiary-pensions token-id) u50) err-invalid-pension-data))
+        )
+        
+        (map-set token-count current-owner (- (default-to u0 (map-get? token-count current-owner)) u1))
+        (map-set token-count beneficiary (+ (default-to u0 (map-get? token-count beneficiary)) u1))
+        
+        (map-set inheritance-claims token-id (merge claim-info {
+            claim-status: "completed"
+        }))
+        
+        (ok beneficiary)
+    )
+)
+
+(define-public (contest-inheritance-claim (token-id uint) (reason (string-ascii 100)))
+    (let ((claim-info (unwrap! (map-get? inheritance-claims token-id) err-inheritance-not-claimable))
+          (current-owner (unwrap! (nft-get-owner? pension-nft token-id) err-nft-not-found)))
+        
+        (asserts! (or (is-eq tx-sender current-owner) (is-eq tx-sender contract-owner)) err-not-token-owner)
+        (asserts! (is-eq (get claim-status claim-info) "pending") err-inheritance-not-claimable)
+        (asserts! (< stacks-block-height (get waiting-period-end claim-info)) err-inheritance-period-not-met)
+        
+        (map-set inheritance-claims token-id (merge claim-info {
+            claim-status: "contested",
+            contested: true
+        }))
+        
+        (ok true)
+    )
+)
+
+(define-public (emergency-override-inheritance (token-id uint) (new-owner principal))
+    (let ((current-owner (unwrap! (nft-get-owner? pension-nft token-id) err-nft-not-found)))
+        
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        
+        (try! (nft-transfer? pension-nft token-id current-owner new-owner))
+        
+        (map-set pension-transfers token-id {
+            from: current-owner,
+            to: new-owner,
+            transfer-date: stacks-block-height,
+            transfer-price: u0
+        })
+        
+        (let ((owner-pensions (default-to (list) (map-get? employee-pensions current-owner)))
+              (new-owner-pensions (default-to (list) (map-get? employee-pensions new-owner))))
+            (map-set employee-pensions current-owner (filter-pension-list owner-pensions token-id))
+            (map-set employee-pensions new-owner (unwrap! (as-max-len? (append new-owner-pensions token-id) u50) err-invalid-pension-data))
+        )
+        
+        (map-set token-count current-owner (- (default-to u0 (map-get? token-count current-owner)) u1))
+        (map-set token-count new-owner (+ (default-to u0 (map-get? token-count new-owner)) u1))
+        
+        (ok new-owner)
+    )
+)
+
+(define-public (update-inheritance-waiting-period (new-period uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> new-period u0) err-invalid-pension-data)
+        
+        (var-set inheritance-waiting-period new-period)
+        (ok new-period)
+    )
+)
+
+(define-public (update-max-beneficiaries (new-max uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> new-max u0) err-invalid-pension-data)
+        (asserts! (<= new-max u10) err-invalid-pension-data)
+        
+        (var-set max-beneficiaries-per-token new-max)
+        (ok new-max)
+    )
+)
+
+(define-read-only (get-pension-beneficiaries (token-id uint))
+    (map-get? pension-beneficiaries token-id)
+)
+
+(define-read-only (get-beneficiary-rights (token-id uint) (beneficiary principal))
+    (map-get? beneficiary-rights {token-id: token-id, beneficiary: beneficiary})
+)
+
+(define-read-only (get-beneficiary-verification (token-id uint) (beneficiary principal))
+    (map-get? beneficiary-verification {token-id: token-id, beneficiary: beneficiary})
+)
+
+(define-read-only (get-inheritance-claim (token-id uint))
+    (map-get? inheritance-claims token-id)
+)
+
+(define-read-only (get-inheritance-waiting-period)
+    (var-get inheritance-waiting-period)
+)
+
+(define-read-only (get-max-beneficiaries-per-token)
+    (var-get max-beneficiaries-per-token)
+)
+
+(define-read-only (is-eligible-beneficiary (token-id uint) (beneficiary principal))
+    (match (map-get? beneficiary-rights {token-id: token-id, beneficiary: beneficiary})
+        rights (ok (get is-active rights))
+        (ok false)
+    )
+)
+
+(define-read-only (calculate-inheritance-value (token-id uint) (beneficiary principal))
+    (match (map-get? beneficiary-rights {token-id: token-id, beneficiary: beneficiary})
+        rights 
+            (match (map-get? pension-valuations token-id)
+                valuation 
+                    (let ((total-value (get current-value valuation))
+                          (percentage (get inheritance-percentage rights)))
+                        (ok (/ (* total-value percentage) u100))
+                    )
+                (err err-nft-not-found)
+            )
+        (err err-beneficiary-not-found)
+    )
+)
+
+(define-read-only (get-beneficiary-summary (token-id uint))
+    (match (map-get? pension-beneficiaries token-id)
+        beneficiaries
+            (ok {
+                primary-beneficiary: (get primary-beneficiary beneficiaries),
+                beneficiary-count: (get beneficiary-count beneficiaries),
+                designation-date: (get designation-date beneficiaries),
+                last-updated: (get last-updated beneficiaries)
+            })
+        (err err-nft-not-found)
+    )
+)
+
+
