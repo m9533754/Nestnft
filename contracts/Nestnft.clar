@@ -180,6 +180,19 @@
         (asserts! (is-eq tx-sender sender) err-not-token-owner)
         (asserts! (is-some (nft-get-owner? pension-nft token-id)) err-nft-not-found)
         
+        ;; Check if multi-sig governance is required
+        (match (map-get? multisig-config token-id)
+            config
+                (if (get is-active config)
+                    ;; Multi-sig is active - this transfer must be via executed proposal
+                    (asserts! false err-multisig-required)
+                    ;; Multi-sig not active - proceed normally
+                    true
+                )
+            ;; No multi-sig config - proceed normally  
+            true
+        )
+        
         (map-set pension-transfers token-id {
             from: sender,
             to: recipient,
@@ -548,6 +561,19 @@
         (asserts! (> inheritance-percentage u0) err-invalid-pension-data)
         (asserts! (<= inheritance-percentage u100) err-invalid-pension-data)
         
+        ;; Check if multi-sig governance is required
+        (match (map-get? multisig-config token-id)
+            config
+                (if (get is-active config)
+                    ;; Multi-sig is active - this action must be via executed proposal
+                    (asserts! false err-multisig-required)
+                    ;; Multi-sig not active - proceed normally
+                    true
+                )
+            ;; No multi-sig config - proceed normally  
+            true
+        )
+        
         (map-set pension-beneficiaries token-id (merge current-beneficiaries {
             primary-beneficiary: (some beneficiary),
             inheritance-percentage: (list inheritance-percentage),
@@ -870,6 +896,219 @@
                 last-updated: (get last-updated beneficiaries)
             })
         (err err-nft-not-found)
+    )
+)
+
+;; Multi-Signature Governance System
+;; Allows pension holders to require multiple approvals for critical operations
+
+(define-constant err-invalid-threshold (err u126))
+(define-constant err-not-co-signer (err u127))
+(define-constant err-proposal-not-found (err u128))
+(define-constant err-proposal-already-executed (err u129))
+(define-constant err-proposal-expired (err u130))
+(define-constant err-already-approved (err u131))
+(define-constant err-insufficient-approvals (err u132))
+(define-constant err-multisig-required (err u133))
+
+(define-data-var proposal-counter uint u0)
+
+;; Multi-sig configuration for each pension token
+(define-map multisig-config uint {
+    co-signers: (list 5 principal),
+    threshold: uint,
+    is-active: bool,
+    created-at: uint
+})
+
+;; Proposal tracking
+(define-map governance-proposals uint {
+    token-id: uint,
+    proposer: principal,
+    action-type: (string-ascii 30),
+    target-address: (optional principal),
+    proposal-data: (string-ascii 200),
+    approvals: (list 5 principal),
+    approval-count: uint,
+    is-executed: bool,
+    created-at: uint,
+    expires-at: uint
+})
+
+;; Track individual approvals
+(define-map proposal-approvals {proposal-id: uint, signer: principal} bool)
+
+;; Setup multi-signature governance for a pension token
+(define-public (setup-multisig-governance (token-id uint) (co-signers (list 5 principal)) (threshold uint))
+    (let ((token-owner (unwrap! (nft-get-owner? pension-nft token-id) err-nft-not-found))
+          (signer-count (len co-signers)))
+        
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (> threshold u1) err-invalid-threshold)
+        (asserts! (<= threshold signer-count) err-invalid-threshold)
+        (asserts! (> signer-count u1) err-invalid-threshold)
+        
+        (map-set multisig-config token-id {
+            co-signers: co-signers,
+            threshold: threshold,
+            is-active: true,
+            created-at: stacks-block-height
+        })
+        
+        (ok true)
+    )
+)
+
+;; Propose an action that requires multi-sig approval
+(define-public (propose-action (token-id uint) (action-type (string-ascii 30)) (target-address (optional principal)) (proposal-data (string-ascii 200)))
+    (let ((multisig (unwrap! (map-get? multisig-config token-id) err-nft-not-found))
+          (proposal-id (+ (var-get proposal-counter) u1)))
+        
+        (asserts! (get is-active multisig) err-multisig-required)
+        (asserts! (is-some (index-of (get co-signers multisig) tx-sender)) err-not-co-signer)
+        
+        (map-set governance-proposals proposal-id {
+            token-id: token-id,
+            proposer: tx-sender,
+            action-type: action-type,
+            target-address: target-address,
+            proposal-data: proposal-data,
+            approvals: (list tx-sender),
+            approval-count: u1,
+            is-executed: false,
+            created-at: stacks-block-height,
+            expires-at: (+ stacks-block-height u1440) ;; 24 hours
+        })
+        
+        (map-set proposal-approvals {proposal-id: proposal-id, signer: tx-sender} true)
+        (var-set proposal-counter proposal-id)
+        
+        (ok proposal-id)
+    )
+)
+
+;; Approve a pending proposal
+(define-public (approve-proposal (proposal-id uint))
+    (let ((proposal (unwrap! (map-get? governance-proposals proposal-id) err-proposal-not-found))
+          (token-id (get token-id proposal))
+          (multisig (unwrap! (map-get? multisig-config token-id) err-nft-not-found))
+          (existing-approval (default-to false (map-get? proposal-approvals {proposal-id: proposal-id, signer: tx-sender}))))
+        
+        (asserts! (get is-active multisig) err-multisig-required)
+        (asserts! (is-some (index-of (get co-signers multisig) tx-sender)) err-not-co-signer)
+        (asserts! (not (get is-executed proposal)) err-proposal-already-executed)
+        (asserts! (< stacks-block-height (get expires-at proposal)) err-proposal-expired)
+        (asserts! (not existing-approval) err-already-approved)
+        
+        (let ((new-approvals (unwrap! (as-max-len? (append (get approvals proposal) tx-sender) u5) err-invalid-pension-data))
+              (new-count (+ (get approval-count proposal) u1)))
+            
+            (map-set governance-proposals proposal-id (merge proposal {
+                approvals: new-approvals,
+                approval-count: new-count
+            }))
+            
+            (map-set proposal-approvals {proposal-id: proposal-id, signer: tx-sender} true)
+            
+            (ok new-count)
+        )
+    )
+)
+
+;; Execute an approved action
+(define-public (execute-approved-action (proposal-id uint))
+    (let ((proposal (unwrap! (map-get? governance-proposals proposal-id) err-proposal-not-found))
+          (token-id (get token-id proposal))
+          (multisig (unwrap! (map-get? multisig-config token-id) err-nft-not-found)))
+        
+        (asserts! (not (get is-executed proposal)) err-proposal-already-executed)
+        (asserts! (< stacks-block-height (get expires-at proposal)) err-proposal-expired)
+        (asserts! (>= (get approval-count proposal) (get threshold multisig)) err-insufficient-approvals)
+        (asserts! (is-some (index-of (get co-signers multisig) tx-sender)) err-not-co-signer)
+        
+        (map-set governance-proposals proposal-id (merge proposal {
+            is-executed: true
+        }))
+        
+        (ok (get action-type proposal))
+    )
+)
+
+;; Check if an action requires multi-sig approval
+(define-read-only (requires-multisig-approval (token-id uint))
+    (match (map-get? multisig-config token-id)
+        config (ok (get is-active config))
+        (ok false)
+    )
+)
+
+;; Get multi-sig configuration for a token
+(define-read-only (get-multisig-config (token-id uint))
+    (map-get? multisig-config token-id)
+)
+
+;; Get proposal details
+(define-read-only (get-proposal-status (proposal-id uint))
+    (map-get? governance-proposals proposal-id)
+)
+
+;; Check if a principal is a co-signer for a token
+(define-read-only (is-co-signer (token-id uint) (signer principal))
+    (match (map-get? multisig-config token-id)
+        config (ok (is-some (index-of (get co-signers config) signer)))
+        (ok false)
+    )
+)
+
+;; Get approval progress for a proposal
+(define-read-only (calculate-approval-progress (proposal-id uint))
+    (match (map-get? governance-proposals proposal-id)
+        proposal 
+            (let ((token-id (get token-id proposal))
+                  (multisig (map-get? multisig-config token-id)))
+                (match multisig
+                    config (ok {
+                        current-approvals: (get approval-count proposal),
+                        required-approvals: (get threshold config),
+                        is-ready: (>= (get approval-count proposal) (get threshold config)),
+                        expires-at: (get expires-at proposal)
+                    })
+                    (err err-nft-not-found)
+                )
+            )
+        (err err-proposal-not-found)
+    )
+)
+
+;; Update multi-sig threshold
+(define-public (update-multisig-threshold (token-id uint) (new-threshold uint))
+    (let ((token-owner (unwrap! (nft-get-owner? pension-nft token-id) err-nft-not-found))
+          (multisig (unwrap! (map-get? multisig-config token-id) err-nft-not-found)))
+        
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (> new-threshold u1) err-invalid-threshold)
+        (asserts! (<= new-threshold (len (get co-signers multisig))) err-invalid-threshold)
+        
+        (map-set multisig-config token-id (merge multisig {
+            threshold: new-threshold
+        }))
+        
+        (ok new-threshold)
+    )
+)
+
+;; Disable multi-sig governance
+(define-public (disable-multisig-governance (token-id uint))
+    (let ((token-owner (unwrap! (nft-get-owner? pension-nft token-id) err-nft-not-found))
+          (multisig (unwrap! (map-get? multisig-config token-id) err-nft-not-found)))
+        
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        
+        (map-set multisig-config token-id (merge multisig {
+            is-active: false
+        }))
+        
+        (ok true)
     )
 )
 
